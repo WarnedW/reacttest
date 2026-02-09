@@ -8,10 +8,7 @@ import type {
   VehicleCreatePayload,
   VehicleUpdatePayload,
 } from '@/types'
-import {
-  getVehiclesFromCache,
-  setVehiclesCache,
-} from '@/utils'
+import { getVehiclesFromCache, setVehiclesCache } from '@/utils'
 
 export interface VehiclesStore {
   items: Vehicle[]
@@ -30,6 +27,48 @@ export interface VehiclesStore {
 
 let abortController: AbortController | null = null
 
+function isAbortError(e: unknown): boolean {
+  if (!(e instanceof Error)) return false
+  return (
+    e.name === 'AbortError' ||
+    e.name === 'CanceledError' ||
+    (e as { code?: string }).code === 'ERR_CANCELED'
+  )
+}
+
+function getAbortSignal(): AbortSignal {
+  if (abortController) abortController.abort()
+  abortController = new AbortController()
+  return abortController.signal
+}
+
+function clearAbortController(): void {
+  abortController = null
+}
+
+function persistCache(items: Vehicle[]): void {
+  setVehiclesCache(items)
+}
+
+function getNextId(items: Vehicle[]): number {
+  const max = items.length === 0 ? 0 : Math.max(...items.map((v) => v.id))
+  return max + 1
+}
+
+function buildVehicleFromPayload(id: number, payload: VehicleCreatePayload): Vehicle {
+  const now = new Date().getFullYear()
+  return {
+    id,
+    name: payload.name ?? '',
+    model: payload.model ?? '',
+    year: Number(payload.year) || now,
+    color: payload.color ?? '',
+    price: Number(payload.price) || 0,
+    latitude: payload.latitude ?? 0,
+    longitude: payload.longitude ?? 0,
+  }
+}
+
 export function createVehiclesStore(): VehiclesStore {
   return makeAutoObservable({
     items: [] as Vehicle[],
@@ -39,65 +78,53 @@ export function createVehiclesStore(): VehiclesStore {
     sortOrder: 'asc' as SortOrder,
 
     get sortedItems(): Vehicle[] {
-      if (!this.sortBy) return [...this.items]
-      const sorted = [...this.items].sort((a, b) => {
-        const aVal = a[this.sortBy!]
-        const bVal = b[this.sortBy!]
-        if (typeof aVal === 'number' && typeof bVal === 'number') {
-          return this.sortOrder === 'asc' ? aVal - bVal : bVal - aVal
-        }
-        return String(aVal).localeCompare(String(bVal), undefined, { numeric: true })
+      const { sortBy, sortOrder, items } = this
+      if (!sortBy) return [...items]
+      const dir = sortOrder === 'asc' ? 1 : -1
+      return [...items].sort((a, b) => {
+        const aVal = a[sortBy] as number
+        const bVal = b[sortBy] as number
+        return (aVal - bVal) * dir
       })
-      return sorted
     },
 
     setSort(field: SortField): void {
-      if (this.sortBy === field) {
-        this.sortOrder = this.sortOrder === 'asc' ? 'desc' : 'asc'
-      } else {
-        this.sortBy = field
-        this.sortOrder = 'asc'
-      }
+      const sameField = this.sortBy === field
+      this.sortBy = field
+      this.sortOrder = sameField && this.sortOrder === 'asc' ? 'desc' : 'asc'
     },
 
     async fetchVehicles(forceRefresh = false): Promise<void> {
-      if (!forceRefresh) {
-        const cached = getVehiclesFromCache()
-        if (cached != null) {
+      const cached = !forceRefresh ? getVehiclesFromCache() : null
+      if (cached != null) {
         runInAction(() => {
           this.items = cached
           this.error = null
         })
-          return
-        }
+        return
       }
-      if (abortController) abortController.abort()
-      abortController = new AbortController()
+
+      const signal = getAbortSignal()
       this.loading = true
       this.error = null
-      const signal = abortController.signal
+
       try {
         const data = await fetchVehiclesApi(signal)
-        setVehiclesCache(data)
+        persistCache(data)
         runInAction(() => {
           this.items = data
           this.loading = false
-          abortController = null
+          clearAbortController()
         })
       } catch (e) {
-        const isAborted =
-          e instanceof Error &&
-          (e.name === 'AbortError' ||
-            e.name === 'CanceledError' ||
-            (e as { code?: string }).code === 'ERR_CANCELED')
-        if (isAborted) {
-          abortController = null
+        if (isAbortError(e)) {
+          clearAbortController()
           return
         }
         runInAction(() => {
           this.error = e instanceof Error ? e.message : String(e)
           this.loading = false
-          abortController = null
+          clearAbortController()
         })
       }
     },
@@ -105,24 +132,14 @@ export function createVehiclesStore(): VehiclesStore {
     abortFetch(): void {
       if (abortController) {
         abortController.abort()
-        abortController = null
+        clearAbortController()
       }
     },
 
     addVehicle(payload: VehicleCreatePayload): Vehicle {
-      const id = Math.max(0, ...this.items.map((v) => v.id)) + 1
-      const newItem: Vehicle = {
-        id,
-        name: payload.name ?? '',
-        model: payload.model ?? '',
-        year: Number(payload.year) || new Date().getFullYear(),
-        color: payload.color ?? '',
-        price: Number(payload.price) || 0,
-        latitude: payload.latitude ?? 0,
-        longitude: payload.longitude ?? 0,
-      }
+      const newItem = buildVehicleFromPayload(getNextId(this.items), payload)
       this.items.push(newItem)
-      setVehiclesCache(this.items)
+      persistCache(this.items)
       return newItem
     },
 
@@ -131,12 +148,12 @@ export function createVehiclesStore(): VehiclesStore {
       if (!item) return
       if (updates.name !== undefined) item.name = updates.name
       if (updates.price !== undefined) item.price = Number(updates.price)
-      setVehiclesCache(this.items)
+      persistCache(this.items)
     },
 
     removeVehicle(id: number): void {
       this.items = this.items.filter((v) => v.id !== id)
-      setVehiclesCache(this.items)
+      persistCache(this.items)
     },
   })
 }
